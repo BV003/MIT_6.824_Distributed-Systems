@@ -1,33 +1,76 @@
 package lock
 
 import (
+	"time"
+	"6.5840/kvsrv1/rpc"
 	"6.5840/kvtest1"
 )
 
 type Lock struct {
-	// IKVClerk is a go interface for k/v clerks: the interface hides
-	// the specific Clerk type of ck but promises that ck supports
-	// Put and Get.  The tester passes the clerk in when calling
-	// MakeLock().
-	ck kvtest.IKVClerk
-	// You may add code here
+	ck   kvtest.IKVClerk
+	l    string
+	myID string
 }
 
-// The tester calls MakeLock() and passes in a k/v clerk; your code can
-// perform a Put or Get by calling lk.ck.Put() or lk.ck.Get().
-//
-// Use l as the key to store the "lock state" (you would have to decide
-// precisely what the lock state is).
+
 func MakeLock(ck kvtest.IKVClerk, l string) *Lock {
-	lk := &Lock{ck: ck}
-	// You may add code here
+	lk := &Lock{
+		ck:   ck,
+		l:    l,
+		myID: kvtest.RandValue(8),
+	}
 	return lk
 }
 
 func (lk *Lock) Acquire() {
-	// Your code here
+	for {
+		val, ver, err := lk.ck.Get(lk.l)
+		if err == rpc.ErrNoKey {
+			// Key doesn't exist, try to acquire it using version 0
+			putErr := lk.ck.Put(lk.l, lk.myID, 0)
+			if putErr == rpc.OK {
+				return
+			}
+			if putErr == rpc.ErrMaybe {
+				v, _, e := lk.ck.Get(lk.l)
+				if e == rpc.OK && v == lk.myID {
+					return
+				}
+			}
+		} else if err == rpc.OK {
+			if val == "" {
+				// Key exists but is free, try to acquire it using the current version
+				putErr := lk.ck.Put(lk.l, lk.myID, ver)
+				if putErr == rpc.OK {
+					return
+				}
+				if putErr == rpc.ErrMaybe {
+					v, _, e := lk.ck.Get(lk.l)
+					if e == rpc.OK && v == lk.myID {
+						return
+					}
+				}
+			}
+		}
+		// Lock is busy, or Put failed due to concurrency. Sleep and retry.
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func (lk *Lock) Release() {
-	// Your code here
+	for {
+		val, ver, err := lk.ck.Get(lk.l)
+		if err == rpc.OK && val == lk.myID {
+			putErr := lk.ck.Put(lk.l, "", ver)
+			if putErr == rpc.OK {
+				return
+			}
+			// If putErr is ErrMaybe or ErrVersion, we loop back to check if the lock
+			// was successfully released (or taken by someone else) in Get().
+		} else {
+			// We do not hold the lock anymore, or it doesn't exist, so we are done.
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
