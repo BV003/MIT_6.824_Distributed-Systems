@@ -50,3 +50,8 @@ Call Get(l) to check if we still hold the lock:
 - If Put returns rpc.ErrMaybe or rpc.ErrVersion, our previous release attempt might have actually succeeded (meaning the value has already changed to "" or been claimed by someone else). We loop back to Get(l) to verify.
 - If the lock is already released or held by someone else (val != myID):
 - We don't hold the lock anymore, meaning the release is complete. We return!
+
+## Key/value server with dropped messages 
+
+## Implementing a lock using key/value clerk and unreliable network 
+
