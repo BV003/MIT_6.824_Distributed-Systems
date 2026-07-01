@@ -1,5 +1,7 @@
 # Raft
 
+实现多服务器之间的分布式协议，对外暴露为一个服务器的抽象
+
 A replicated service achieves fault tolerance by storing complete copies of its state (i.e., data) on multiple replica servers.
 
 Raft organizes client requests into a sequence, called the log, and ensures that all the replica servers see the same log.
@@ -53,3 +55,46 @@ ticker 是一个在每个 Raft 节点后台运行的、无限循环的 Go 协程
 ## log
 
 client will only get access with leader.
+
+
+func (rf *Raft) Start(command interface{}) (int, int, bool) 
+当客户端发送一个写请求（例如 Set x = 5）到服务器时，上层服务无法直接将其写入本地数据库，必须先通过调用 rf.Start("Set x = 5") 将这个指令交由 Raft 模块进行多节点间的共识同步。
+index：该指令在日志数组中的预期索引位置（如果未来被成功提交的话）。
+term：当前的任期号。
+isLeader：返回 true，代表自己是 Leader。
+
+Implement the Applier Loop (applyCh)
+applyCh（全称 Apply Channel）是 Go 语言中的一个通道（Channel），其本质上是一个线程安全的先进先出（FIFO）数据管道。
+在 MIT 6.5840 实验中，它是底层 Raft 模块与上层应用服务（如键值对数据库）之间进行通信的唯一桥梁。
+
+第一阶段：Raft 模块在后台默默干活（同步到大多数节点）
+这个阶段完全发生在 Raft 协议层，数据库（状态机）此时根本不知情，也没有执行任何写操作。
+1. Leader 的 Raft 模块通过网络向各个 Follower 的 Raft 模块发送 AppendEntries RPC。
+2. 此时，各台机器的数据库里都还没有 x = 5 这个数据。
+3. 当大多数节点的 Raft 模块回复“已成功将该日志写入本地日志数组”后，Leader 的 Raft 模块判定：这条日志安全了（已提交 / Committed）。
+第二阶段：服务器的数据库真正执行 x = 5（Apply 到状态机）
+这个阶段是在第一阶段成功判定安全之后，才触发的后续操作。
+1. Leader 的 Raft 模块判定安全（已提交）后，会把这个消息放入 applyCh 管道。
+2. 服务器的数据库服务从 applyCh 管道中取出这个消息。
+3. 数据库将 x = 5 写入自己的内存中。直到此时，数据才真正写入了数据库，客户端才能读到它。
+
+To prevent blocking the core locks of your Raft peers, committed entries are applied to the database asynchronously through a dedicated thread started in Make()
+
+领导者（Leader）在没有新日志写入时，也一定会每隔一段时间自动发送 AppendEntriesArgs。领导者不会为了专门宣告“某条日志已提交”而发明一个新的 RPC。相反，它会顺票搭车（Piggyback），利用现有的 AppendEntries RPC（附加日志/心跳） 来通知跟随者。
+
+Raft 明确划分了领导者选举、日志复制和安全性保障三个子问题，这让工程师在编写代码、排查 Bug 时思路极为清晰。
+
+## Part 3C: persistence
+If a Raft-based server reboots it should resume service where it left off. This requires that Raft keep persistent state that survives a reboot.
+
+Raft 论文中明确规定，有且仅有以下 3 个变量 必须在做出任何改变之前，强行刷入磁盘（Must be persisted to stable storage before responding to RPCs）：
+1. currentTerm（当前任期号）：
+- 为什么：防止节点重启后任期倒退。如果重启后任期变小，它可能会给一个已经过期的候选者投票，或者发起一个本不该发生的低任期选举，导致脑裂。
+2. votedFor（在当前任期投给谁了）：
+- 为什么：防止一票多投。如果节点在 Term 2 投给了 A，然后崩溃重启，内存数据丢失。重启后它如果又在 Term 2 投给了 B，这就违反了“一个节点在一届任期内最多只能投一票”的铁律，直接导致选出两个 Leader。
+3. log[]（所有的日志条目，包含 Index、Term 和 Command）：
+- 为什么：这是系统的数据根本。一旦 Leader 确认某条日志已提交，该日志就绝对不能丢失。
+
+## Part 3D: log compaction
+
+implement version can get rid of log. And we use snapshot to replace.
