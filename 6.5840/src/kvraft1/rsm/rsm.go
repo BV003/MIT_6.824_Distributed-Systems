@@ -1,25 +1,25 @@
 package rsm
 
 import (
+	"crypto/rand"
+	"math/big"
 	"sync"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
 	"6.5840/raft1"
 	"6.5840/raftapi"
 	"6.5840/tester1"
-
 )
 
-var useRaftStateMachine bool // to plug in another raft besided raft1
-
+var useRaftStateMachine bool // to plug in another raft besides raft1
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Id      int64
+	Term    int
+	Command any
 }
-
 
 // A server (i.e., ../server.go) that wants to replicate itself calls
 // MakeRSM and must implement the StateMachine interface.  This
@@ -33,6 +33,12 @@ type StateMachine interface {
 	Restore([]byte)
 }
 
+type Notification struct {
+	id     int64
+	term   int
+	result any
+}
+
 type RSM struct {
 	mu           sync.Mutex
 	me           int
@@ -40,22 +46,17 @@ type RSM struct {
 	applyCh      chan raftapi.ApplyMsg
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
-	// Your definitions here.
+
+	pendingOps map[int]chan Notification
 }
 
-// servers[] contains the ports of the set of
-// servers that will cooperate via Raft to
-// form the fault-tolerant key/value service.
-//
-// me is the index of the current server in servers[].
-//
-// the k/v server should store snapshots through the underlying Raft
-// implementation, which should call persister.SaveStateAndSnapshot() to
-// atomically save the Raft state along with the snapshot.
-// The RSM should snapshot when Raft's saved state exceeds maxraftstate bytes,
-// in order to allow Raft to garbage-collect its log. if maxraftstate is -1,
-// you don't need to snapshot.
-//
+func nrand() int64 {
+	max := big.NewInt(1)
+	max.Lsh(max, 62)
+	n, _ := rand.Int(rand.Reader, max)
+	return n.Int64()
+}
+
 // MakeRSM() must return quickly, so it should start goroutines for
 // any long-running work.
 func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, maxraftstate int, sm StateMachine) *RSM {
@@ -64,10 +65,15 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		maxraftstate: maxraftstate,
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
+		pendingOps:   make(map[int]chan Notification),
 	}
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+
+	// Start the background reader goroutine
+	go rsm.applyReader()
+
 	return rsm
 }
 
@@ -75,16 +81,100 @@ func (rsm *RSM) Raft() raftapi.Raft {
 	return rsm.rf
 }
 
+func (rsm *RSM) applyReader() {
+	for msg := range rsm.applyCh {
+		if msg.CommandValid {
+			op, ok := msg.Command.(Op)
+			if !ok {
+				continue
+			}
+
+			// Execute the command on the StateMachine
+			res := rsm.sm.DoOp(op.Command)
+
+			// Notify waiting Submit goroutine
+			rsm.mu.Lock()
+			ch, exists := rsm.pendingOps[msg.CommandIndex]
+			if exists {
+				delete(rsm.pendingOps, msg.CommandIndex)
+				notification := Notification{
+					id:     op.Id,
+					term:   op.Term,
+					result: res,
+				}
+				rsm.mu.Unlock()
+				// Send notification without holding lock
+				ch <- notification
+			} else {
+				rsm.mu.Unlock()
+			}
+		}
+	}
+
+	// When applyCh is closed, it means the server is shutting down.
+	// Clean up all pending channels to wake up any blocked Submit() calls.
+	rsm.mu.Lock()
+	for index, ch := range rsm.pendingOps {
+		delete(rsm.pendingOps, index)
+		close(ch)
+	}
+	rsm.mu.Unlock()
+}
 
 // Submit a command to Raft, and wait for it to be committed.  It
 // should return ErrWrongLeader if client should find new leader and
 // try again.
 func (rsm *RSM) Submit(req any) (rpc.Err, any) {
+	// Call Start first to find out if we are leader and get the initial index/term
+	term, isLeader := rsm.rf.GetState()
+	if !isLeader {
+		return rpc.ErrWrongLeader, nil
+	}
 
-	// Submit creates an Op structure to run a command through Raft;
-	// for example: op := Op{Me: rsm.me, Id: id, Req: req}, where req
-	// is the argument to Submit and id is a unique id for the op.
+	op := Op{
+		Id:      nrand(),
+		Term:    term,
+		Command: req,
+	}
 
-	// your code here
-	return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+	index, startTerm, isLeader := rsm.rf.Start(op)
+	if !isLeader {
+		return rpc.ErrWrongLeader, nil
+	}
+
+	// Just in case the term changed between GetState() and Start()
+	op.Term = startTerm
+
+	rsm.mu.Lock()
+	ch := make(chan Notification, 1)
+	rsm.pendingOps[index] = ch
+	rsm.mu.Unlock()
+
+	defer func() {
+		rsm.mu.Lock()
+		delete(rsm.pendingOps, index)
+		rsm.mu.Unlock()
+	}()
+
+	// Loop to periodically check for leadership changes or server shutdown
+	for {
+		select {
+		case notification, ok := <-ch:
+			if !ok {
+				// Channel closed due to shutdown
+				return rpc.ErrWrongLeader, nil
+			}
+			if notification.term != startTerm || notification.id != op.Id {
+				return rpc.ErrWrongLeader, nil
+			}
+			return rpc.OK, notification.result
+		default:
+			// Check if we lost leadership or term changed
+			currTerm, currIsLeader := rsm.rf.GetState()
+			if !currIsLeader || currTerm != startTerm {
+				return rpc.ErrWrongLeader, nil
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 }
