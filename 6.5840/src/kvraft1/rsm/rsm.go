@@ -71,6 +71,12 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
 
+	// Read existing snapshot on restart
+	snapshot := persister.ReadSnapshot()
+	if len(snapshot) > 0 {
+		rsm.sm.Restore(snapshot)
+	}
+
 	// Start the background reader goroutine
 	go rsm.applyReader()
 
@@ -108,6 +114,15 @@ func (rsm *RSM) applyReader() {
 			} else {
 				rsm.mu.Unlock()
 			}
+
+			// Check if we need to snapshot
+			if rsm.maxraftstate != -1 && rsm.rf.PersistBytes() >= rsm.maxraftstate {
+				snapshotBytes := rsm.sm.Snapshot()
+				rsm.rf.Snapshot(msg.CommandIndex, snapshotBytes)
+			}
+		} else if msg.SnapshotValid {
+			// Restore the StateMachine using the snapshot
+			rsm.sm.Restore(msg.Snapshot)
 		}
 	}
 
